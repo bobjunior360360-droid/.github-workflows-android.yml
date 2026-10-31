@@ -1,0 +1,240 @@
+name: Android APK
+
+# Run it by hand: Actions tab > "Android APK" > Run workflow.
+# First draft, never run. Read the log of the first run and send me the errors.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Create the Android crate if the repository does not have it
+        run: |
+          set -e
+          if [ -d apps/vectorcraft-android ]; then echo 'crate already in the repository'; exit 0; fi
+          D=apps/vectorcraft-android
+          mkdir -p $D/src
+          cat > $D/Cargo.toml <<'EOF_VC'
+          [package]
+          name = "vectorcraft-android"
+          description = "VectorCraft on Android (eframe NativeActivity shell around VectorcraftApp)"
+          version.workspace = true
+          edition.workspace = true
+          license.workspace = true
+          publish = false
+
+          [lib]
+          # cargo-apk / cargo-ndk load this as libvectorcraft_android.so.
+          crate-type = ["cdylib"]
+
+          # Everything is Android-only so `cargo check --workspace` on a desktop keeps working
+          # (lib.rs is empty off Android).
+          [target.'cfg(target_os = "android")'.dependencies]
+          vectorcraft-engine = { workspace = true, features = ["bundled-fonts"] }
+          vectorcraft-ui-egui = { workspace = true }
+          vectorcraft-text = { workspace = true }
+          egui = { workspace = true }
+          log = { workspace = true }
+          android_logger = "0.14"
+          # UNVERIFIED: the storytold/egui fork must still expose this feature (see README, step 2).
+          eframe = { workspace = true, features = ["android-native-activity", "wgpu", "default_fonts"] }
+
+          [package.metadata.android]
+          package = "ai.storyteller.vectorcraft"
+          build_targets = ["aarch64-linux-android"]
+          apk_name = "VectorCraft"
+
+          [package.metadata.android.sdk]
+          min_sdk_version = 26
+          target_sdk_version = 34
+
+          [package.metadata.android.application]
+          label = "VectorCraft"
+          # Landscape and portrait: the activity handles rotation without restarting.
+          [package.metadata.android.application.activity]
+          config_changes = "orientation|keyboardHidden|screenSize|smallestScreenSize|screenLayout|density"
+          launch_mode = "singleTop"
+          orientation = "unspecified"
+          EOF_VC
+          cat > $D/src/lib.rs <<'EOF_VC'
+          //! VectorCraft on Android.
+          //!
+          //! A small host around `vectorcraft_ui_egui::VectorcraftApp`, modelled on `apps/vectorcraft-web`
+          //! (not on the desktop `main.rs`, which is full of Windows/macOS/Linux code). Everything the
+          //! platform provides reaches the app through `Services` (see `services.rs`).
+          //!
+          //! STATUS: written without a compiler or the Android NDK. Treat it as a first draft to build and
+          //! fix on a machine with them (see README.md). Nothing here has been run.
+          #![cfg(target_os = "android")]
+
+          mod services;
+
+          use eframe::egui_winit::winit::platform::android::activity::AndroidApp;
+          use vectorcraft_engine::Session;
+          use vectorcraft_ui_egui::VectorcraftApp;
+
+          /// The eframe `App`: forwards the three hooks the web host also forwards.
+          struct AndroidShell {
+              app: VectorcraftApp,
+          }
+
+          impl eframe::App for AndroidShell {
+              fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+                  self.app.tick(ctx);
+                  self.app.finish_ime_logic(ctx);
+              }
+
+              fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+                  self.app.raw_input_hook(ctx, raw);
+              }
+
+              fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+                  self.app.ui(ui);
+              }
+          }
+
+          #[unsafe(no_mangle)]
+          fn android_main(android: AndroidApp) {
+              android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("VectorCraft"));
+              let data_dir = android.external_data_path().or_else(|| android.internal_data_path());
+
+              let options = eframe::NativeOptions {
+                  android_app: Some(android),
+                  // The same wgpu renderer as desktop; Vulkan first, GLES as the fallback.
+                  renderer: eframe::Renderer::Wgpu,
+                  ..Default::default()
+              };
+
+              let result = eframe::run_native(
+                  "VectorCraft",
+                  options,
+                  Box::new(move |cc| {
+                      VectorcraftApp::install_ime_reset_hooks(&cc.egui_ctx);
+                      let services = services::services(cc.egui_ctx.clone(), data_dir.clone());
+                      let app = VectorcraftApp::new(Session::new(), services);
+                      Ok(Box::new(AndroidShell { app }))
+                  }),
+              );
+              if let Err(e) = result {
+                  log::error!("VectorCraft failed to start: {e}");
+              }
+          }
+          EOF_VC
+          cat > $D/src/services.rs <<'EOF_VC'
+          //! The platform services Android gives `VectorcraftApp`.
+          //!
+          //! Version 1 needs no Java/Kotlin and no JNI. Files live in the app's own folder:
+          //!   <external data dir>/import/   put files here (adb push, or a file manager) → File ▸ Open reads them
+          //!   <external data dir>/export/   File ▸ Save / Export writes here (the web build's "download")
+          //! Version 2 (not started): replace both with the Storage Access Framework (Intent
+          //! ACTION_OPEN_DOCUMENT / ACTION_CREATE_DOCUMENT) through JNI, delivering bytes through `inbox`
+          //! exactly as the web build does.
+          use std::path::PathBuf;
+          use std::sync::{Arc, Mutex};
+
+          use vectorcraft_ui_egui::Services;
+
+          pub fn services(ctx: egui::Context, data_dir: Option<PathBuf>) -> Services {
+              let inbox: vectorcraft_ui_egui::services::Inbox = Arc::new(Mutex::new(Vec::new()));
+              let import = data_dir.as_ref().map(|d| d.join("import"));
+              let export = data_dir.map(|d| d.join("export"));
+              if let Some(dir) = &import {
+                  let _ = std::fs::create_dir_all(dir);
+              }
+              if let Some(dir) = &export {
+                  let _ = std::fs::create_dir_all(dir);
+              }
+
+              // File ▸ Open: hand every file in import/ to the app, then remove it from the queue folder.
+              let open_inbox = inbox.clone();
+              let open_ctx = ctx.clone();
+              let open_async: Box<dyn FnMut()> = Box::new(move || {
+                  let Some(dir) = &import else { return };
+                  let Ok(entries) = std::fs::read_dir(dir) else { return };
+                  for entry in entries.flatten() {
+                      let path = entry.path();
+                      if !path.is_file() {
+                          continue;
+                      }
+                      match std::fs::read(&path) {
+                          Ok(bytes) => {
+                              let name = entry.file_name().to_string_lossy().to_string();
+                              open_inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                              let _ = std::fs::remove_file(&path);
+                          }
+                          Err(e) => log::error!("couldn't read {}: {e}", path.display()),
+                      }
+                  }
+                  open_ctx.request_repaint();
+              });
+
+              // File ▸ Save / Export: write into export/ (the web build triggers a browser download here).
+              let download: vectorcraft_ui_egui::services::DownloadFn = Box::new(move |name, bytes| {
+                  let Some(dir) = &export else { return Err("no storage folder available".to_string()) };
+                  let safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
+                  let path = dir.join(safe);
+                  std::fs::write(&path, bytes).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
+                  log::info!("saved {}", path.display());
+                  Ok(())
+              });
+
+              Services { inbox: Some(inbox), open_async: Some(open_async), download: Some(download), ..Default::default() }
+          }
+          EOF_VC
+
+      - name: Does the forked eframe offer the Android feature?
+        continue-on-error: true
+        run: |
+          cargo fetch --locked || cargo fetch
+          grep -rn "android" ~/.cargo/git/checkouts/egui-*/*/crates/eframe/Cargo.toml || echo "NO android feature found in eframe"
+
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
+
+      - name: Make a signing key (release APK)
+        run: |
+          keytool -genkeypair -v -keystore "$RUNNER_TEMP/vc.jks" -alias vc -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass vectorcraft -keypass vectorcraft -dname "CN=VectorCraft"
+
+      - name: Build the APK
+        working-directory: apps/vectorcraft-android
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_LATEST_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+          CARGO_APK_RELEASE_KEYSTORE: ${{ runner.temp }}/vc.jks
+          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: vectorcraft
+        run: cargo apk build --release --lib
+
+      - name: Find the APK
+        run: |
+          APK=$(find target -name '*.apk' | head -n1)
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          ls -la "$APK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VectorCraft-apk
+          path: ${{ env.APK }}
+
+      - name: Publish a release with the APK (download it from the phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "$APK" VectorCraft.apk
+          gh release create "android-${{ github.run_number }}" VectorCraft.apk \
+            --title "VectorCraft Android build ${{ github.run_number }}" \
+            --notes "Unofficial first-draft build."

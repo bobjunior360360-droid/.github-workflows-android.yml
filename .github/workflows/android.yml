@@ -52,6 +52,8 @@ jobs:
           android_logger = "0.14"
           # UNVERIFIED: the storytold/egui fork must still expose this feature (see README, step 2).
           eframe = { workspace = true, features = ["android-native-activity", "wgpu", "default_fonts"] }
+          # The same winit the desktop app uses (patched to the fork in the root Cargo.toml).
+          winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
 
           [package.metadata.android]
           package = "ai.storyteller.vectorcraft"
@@ -83,7 +85,7 @@ jobs:
 
           mod services;
 
-          use eframe::egui_winit::winit::platform::android::activity::AndroidApp;
+          use winit::platform::android::activity::AndroidApp;
           use vectorcraft_engine::Session;
           use vectorcraft_ui_egui::VectorcraftApp;
 
@@ -149,7 +151,7 @@ jobs:
           use vectorcraft_ui_egui::Services;
 
           pub fn services(ctx: egui::Context, data_dir: Option<PathBuf>) -> Services {
-              let inbox: vectorcraft_ui_egui::services::Inbox = Arc::new(Mutex::new(Vec::new()));
+              let inbox: vectorcraft_ui_egui::Inbox = Arc::new(Mutex::new(Vec::new()));
               let import = data_dir.as_ref().map(|d| d.join("import"));
               let export = data_dir.map(|d| d.join("export"));
               if let Some(dir) = &import {
@@ -183,7 +185,7 @@ jobs:
               });
 
               // File ▸ Save / Export: write into export/ (the web build triggers a browser download here).
-              let download: vectorcraft_ui_egui::services::DownloadFn = Box::new(move |name, bytes| {
+              let download: vectorcraft_ui_egui::DownloadFn = Box::new(move |name, bytes| {
                   let Some(dir) = &export else { return Err("no storage folder available".to_string()) };
                   let safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
                   let path = dir.join(safe);

@@ -213,11 +213,15 @@ jobs:
       - name: Build the APK
         working-directory: apps/vectorcraft-android
         env:
-          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_LATEST_HOME }}
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
           CARGO_APK_RELEASE_KEYSTORE: ${{ runner.temp }}/vc.jks
           CARGO_APK_RELEASE_KEYSTORE_PASSWORD: vectorcraft
-        run: cargo apk build --release --lib
+        run: |
+          # The runner's own variables are not in the `env` context, so read them in the shell.
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_LATEST_HOME"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          echo "NDK: $ANDROID_NDK_ROOT"
+          ls "$ANDROID_NDK_ROOT" | head
+          cargo apk build --release --lib
 
       - name: Find the APK
         run: |
@@ -238,3 +242,4 @@ jobs:
           gh release create "android-${{ github.run_number }}" VectorCraft.apk \
             --title "VectorCraft Android build ${{ github.run_number }}" \
             --notes "Unofficial first-draft build."
+            
